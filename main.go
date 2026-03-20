@@ -7,15 +7,18 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/pion/webrtc/v3"
-	"github.com/pion/webrtc/v3/pkg/media"
-	"github.com/pion/webrtc/v3/pkg/media/h264reader"
+	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
+	"github.com/pion/webrtc/v4/pkg/media/h264reader"
 )
 
 type Config struct {
@@ -53,11 +56,28 @@ type Negotiation struct {
 var (
 	pc         *webrtc.PeerConnection
 	videoTrack *webrtc.TrackLocalStaticSample
+	audioTrack *webrtc.TrackLocalStaticRTP
 	wsConn     *websocket.Conn
 	cfg        Config
 
-	h264Once sync.Once
+	h264Once  sync.Once
+	audioOnce sync.Once
+	wsMu      sync.Mutex
+
+	// micEnabled 表示“相机端是否应该发送音频”这一逻辑开关。
+	// 目前还没有真正的音频采集与发送逻辑，这个开关主要由 DataChannel 的
+	// `{"type":"camera_mic","enabled":true/false}` 消息来控制，方便后续在音频管线中接入。
+	micEnabled bool
 )
+
+func wsWriteJSON(v interface{}) error {
+	wsMu.Lock()
+	defer wsMu.Unlock()
+	if wsConn == nil {
+		return fmt.Errorf("wsConn is nil")
+	}
+	return wsConn.WriteJSON(v)
+}
 
 func loadConfig() error {
 	f, err := os.Open("config.json")
@@ -108,7 +128,7 @@ func connectAndRun(ctx context.Context) error {
 			UserAgent: "rephone-go-camera/0.1",
 		}),
 	}
-	if err := wsConn.WriteJSON(hello); err != nil {
+	if err := wsWriteJSON(hello); err != nil {
 		return fmt.Errorf("send new failed: %w", err)
 	}
 	log.Printf("Sent 'new' as camera peer, id=%s", cfg.DeviceID)
@@ -148,6 +168,7 @@ func readLoop() error {
 				_ = pc.Close()
 				pc = nil
 				videoTrack = nil
+				audioTrack = nil
 			}
 		case "peers", "keepalive":
 			// optional logging
@@ -168,8 +189,10 @@ func handleOffer(data json.RawMessage) error {
 		_ = pc.Close()
 		pc = nil
 		videoTrack = nil
+		audioTrack = nil
 	}
-	if err := createPeerConnection(nego); err != nil {
+	audioEnabled := offerSupportsOpusAudio(nego.Desc)
+	if err := createPeerConnection(nego, audioEnabled); err != nil {
 		return err
 	}
 
@@ -200,7 +223,7 @@ func handleOffer(data json.RawMessage) error {
 			},
 		}),
 	}
-	return wsConn.WriteJSON(resp)
+	return wsWriteJSON(resp)
 }
 
 func handleCandidate(data json.RawMessage) error {
@@ -211,6 +234,12 @@ func handleCandidate(data json.RawMessage) error {
 	if nego.Candidate == nil || pc == nil {
 		return nil
 	}
+
+	// 打印收到的 candidate
+	log.Printf("RECV candidate: from=%s to=%s sid=%s mid=%v mline=%d cand=%s",
+		nego.From, nego.To, nego.SessionID,
+		nego.Candidate.SDPMid, nego.Candidate.SDPMLineIndex, nego.Candidate.Candidate,
+	)
 	init := webrtc.ICECandidateInit{
 		Candidate:     nego.Candidate.Candidate,
 		SDPMid:        nego.Candidate.SDPMid,
@@ -219,7 +248,7 @@ func handleCandidate(data json.RawMessage) error {
 	return pc.AddICECandidate(init)
 }
 
-func createPeerConnection(nego Negotiation) error {
+func createPeerConnection(nego Negotiation, enableAudio bool) error {
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
@@ -241,6 +270,29 @@ func createPeerConnection(nego Negotiation) error {
 	if _, err = pc.AddTrack(videoTrack); err != nil {
 		return err
 	}
+
+	if enableAudio {
+		audioTrack, err = webrtc.NewTrackLocalStaticRTP(
+			webrtc.RTPCodecCapability{
+				MimeType:  webrtc.MimeTypeOpus,
+				ClockRate: 48000,
+				// Most WebRTC endpoints negotiate Opus as 2-channel in SDP (opus/48000/2).
+				// Using 2 here avoids "codec is not supported by remote" on answer creation.
+				Channels:  2,
+			},
+			"audio", "microphone",
+		)
+		if err != nil {
+			return err
+		}
+		if _, err = pc.AddTrack(audioTrack); err != nil {
+			return err
+		}
+		log.Printf("Audio track enabled (remote offer supports Opus)")
+	} else {
+		audioTrack = nil
+		log.Printf("Audio track disabled (remote offer has no Opus audio m-line)")
+	}
 	// Force H264 in answer so we don't negotiate VP8 while sending H264 (would cause black screen).
 	for _, tr := range pc.GetTransceivers() {
 		if tr.Kind() == webrtc.RTPCodecTypeVideo && tr.Sender() != nil {
@@ -259,6 +311,14 @@ func createPeerConnection(nego Negotiation) error {
 	h264Once.Do(func() {
 		go startH264FromStdin()
 	})
+	// Read Opus RTP packets from local UDP and forward to WebRTC audio track.
+	// Example source:
+	// ffmpeg -f alsa -i hw:3,0 -ac 1 -ar 48000 -c:a libopus -application voip -frame_duration 20 -vn -f rtp rtp://127.0.0.1:5006
+	if enableAudio {
+		audioOnce.Do(func() {
+			go startOpusFromUDP("127.0.0.1:5006")
+		})
+	}
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
@@ -278,9 +338,40 @@ func createPeerConnection(nego Negotiation) error {
 				},
 			}),
 		}
-		if err := wsConn.WriteJSON(msg); err != nil {
+
+		// 打印发送出去的 candidate
+		log.Printf("SEND candidate: from=%s to=%s sid=%s mid=%s mline=%d cand=%s",
+			cfg.DeviceID, nego.From, nego.SessionID,
+			init.SDPMid, init.SDPMLineIndex, init.Candidate,
+		)
+
+		if err := wsWriteJSON(msg); err != nil {
 			log.Printf("send candidate error: %v", err)
 		}
+	})
+
+	// 监控端会在其 RTCPeerConnection 上创建 DataChannel（用于事件回放、缩略图、麦克风控制等）。
+	// 这里监听 DataChannel 并解析 JSON 消息中的 "camera_mic" 指令，更新本端 micEnabled 状态，
+	// 以便后续接入真正的音频采集/发送逻辑时使用。
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		log.Printf("DataChannel opened: label=%s id=%d", dc.Label(), dc.ID())
+
+		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+			if msg.IsString {
+				var payload map[string]interface{}
+				if err := json.Unmarshal(msg.Data, &payload); err == nil {
+					if t, ok := payload["type"].(string); ok && t == "camera_mic" {
+						enabled, _ := payload["enabled"].(bool)
+						micEnabled = enabled
+						log.Printf("camera_mic control received via DataChannel, enabled=%v", enabled)
+						// TODO: 当接入真实音频采集时，在这里根据 micEnabled 打开/关闭音频发送。
+						return
+					}
+				}
+			}
+			// 其他类型消息暂时仅打印日志，方便后续扩展。
+			log.Printf("DataChannel message (label=%s): %d bytes", dc.Label(), len(msg.Data))
+		})
 	})
 
 	return nil
@@ -317,6 +408,96 @@ func isVCL(typ int) bool {
 	return typ == 1 || typ == 5
 }
 
+// rbspFromNAL removes emulation-prevention bytes (0x03) from NAL payload.
+// Input data should start from the first byte AFTER the NAL header.
+func rbspFromNAL(data []byte) []byte {
+	if len(data) == 0 {
+		return nil
+	}
+	out := make([]byte, 0, len(data))
+	zeroCount := 0
+	for _, b := range data {
+		if zeroCount >= 2 && b == 0x03 {
+			// skip emulation-prevention byte
+			zeroCount = 0
+			continue
+		}
+		out = append(out, b)
+		if b == 0x00 {
+			zeroCount++
+		} else {
+			zeroCount = 0
+		}
+	}
+	return out
+}
+
+type bitReader struct {
+	b   []byte
+	pos int // bit position
+}
+
+func (r *bitReader) readBit() (uint8, bool) {
+	if r.pos >= len(r.b)*8 {
+		return 0, false
+	}
+	byteIdx := r.pos / 8
+	bitIdx := 7 - (r.pos % 8)
+	r.pos++
+	return (r.b[byteIdx] >> bitIdx) & 1, true
+}
+
+func (r *bitReader) readUE() (uint32, bool) {
+	// Exp-Golomb ue(v)
+	zeros := 0
+	for {
+		bit, ok := r.readBit()
+		if !ok {
+			return 0, false
+		}
+		if bit == 0 {
+			zeros++
+			// avoid pathological
+			if zeros > 31 {
+				return 0, false
+			}
+			continue
+		}
+		break
+	}
+	if zeros == 0 {
+		return 0, true
+	}
+	var val uint32
+	for i := 0; i < zeros; i++ {
+		bit, ok := r.readBit()
+		if !ok {
+			return 0, false
+		}
+		val = (val << 1) | uint32(bit)
+	}
+	return (1<<uint32(zeros) - 1) + val, true
+}
+
+// isFirstSlice checks whether this VCL NAL is the first slice of a new frame (first_mb_in_slice == 0).
+// nalData is the raw NAL bytes (without Annex-B start code), starting with the NAL header.
+func isFirstSlice(nalData []byte) bool {
+	if len(nalData) < 2 {
+		return false
+	}
+	typ := int(nalData[0] & 0x1f)
+	if typ != 1 && typ != 5 {
+		return false
+	}
+	rbsp := rbspFromNAL(nalData[1:])
+	br := &bitReader{b: rbsp}
+	firstMB, ok := br.readUE()
+	if !ok {
+		return false
+	}
+	return firstMB == 0
+}
+
 // startH264FromStdin uses Pion 的 h264reader 从 stdin 读取 Annex-B H264，
 // 完全复用官方 play-from-disk-h264 的 NAL 解析逻辑，避免手写解析带来的花屏问题。
 // 该 goroutine 在进程生命周期内只启动一次，通过全局 videoTrack 将数据送入当前活跃的 PeerConnection。
@@ -329,6 +510,7 @@ func startH264FromStdin() {
 	}
 
 	frameInterval := time.Second / 30
+
 	for {
 		nal, readErr := h264.NextNAL()
 		if readErr != nil {
@@ -343,19 +525,17 @@ func startH264FromStdin() {
 			continue
 		}
 
-		// 没有活跃的 track 时，丢弃此帧但保持读取，以免阻塞 ffmpeg 管道。
 		currentTrack := videoTrack
 		if currentTrack == nil {
 			continue
 		}
 
-		// h264reader 返回的 Data 不含起始码，按官方示例前面补 0x00000001。
+		// h264reader 返回的 Data 不含起始码，前面补 0x00000001。
 		payload := make([]byte, 4+len(nal.Data))
 		copy(payload[0:4], []byte{0x00, 0x00, 0x00, 0x01})
 		copy(payload[4:], nal.Data)
 
 		typ := int(nal.Data[0] & 0x1f)
-		// 只有 VCL (1/5) 推进时间轴，其余 Duration=0。
 		duration := time.Duration(0)
 		if isVCL(typ) {
 			duration = frameInterval
@@ -366,11 +546,62 @@ func startH264FromStdin() {
 			log.Printf("First NAL via h264reader: %d bytes (type %d)", len(payload), typ)
 		}
 
-		if writeErr := currentTrack.WriteSample(media.Sample{Data: payload, Duration: duration}); writeErr != nil {
+		if writeErr := currentTrack.WriteSample(
+			media.Sample{Data: payload, Duration: duration},
+		); writeErr != nil {
 			log.Printf("WriteSample error: %v", writeErr)
 			return
 		}
 	}
+}
+
+func startOpusFromUDP(addr string) {
+	pcAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		log.Printf("startOpusFromUDP resolve addr error: %v", err)
+		return
+	}
+	conn, err := net.ListenUDP("udp", pcAddr)
+	if err != nil {
+		log.Printf("startOpusFromUDP listen error: %v", err)
+		return
+	}
+	defer conn.Close()
+	log.Printf("startOpusFromUDP listening on %s", addr)
+
+	buf := make([]byte, 1600)
+	pkt := &rtp.Packet{}
+	for {
+		n, _, readErr := conn.ReadFromUDP(buf)
+		if readErr != nil {
+			log.Printf("startOpusFromUDP read error: %v", readErr)
+			return
+		}
+		if !micEnabled {
+			continue
+		}
+
+		currentTrack := audioTrack
+		if currentTrack == nil {
+			continue
+		}
+
+		if err := pkt.Unmarshal(buf[:n]); err != nil {
+			continue
+		}
+		if err := currentTrack.WriteRTP(pkt); err != nil {
+			log.Printf("audio WriteRTP error: %v", err)
+			return
+		}
+	}
+}
+
+func offerSupportsOpusAudio(desc *webrtc.SessionDescription) bool {
+	if desc == nil || desc.SDP == "" {
+		return false
+	}
+	sdp := strings.ToLower(desc.SDP)
+	return strings.Contains(sdp, "m=audio") && strings.Contains(sdp, "opus/48000")
 }
 
 func mustJSON(v interface{}) json.RawMessage {
